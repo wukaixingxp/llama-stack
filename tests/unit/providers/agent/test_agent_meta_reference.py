@@ -6,11 +6,12 @@
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from llama_stack.apis.agents import Session
+from llama_stack.apis.tools import ToolDef, ToolParameter
 from llama_stack.core.datatypes import User
 from llama_stack.providers.inline.agents.meta_reference.persistence import (
     AgentPersistence,
@@ -345,3 +346,178 @@ class TestAgentPersistenceListSessions:
         mock_kvstore.values_in_range.assert_called_once_with(
             start_key="session:test-agent-123:", end_key="session:test-agent-123:\xff\xff\xff\xff"
         )
+
+
+class TestMCPReferenceResolutionInAgent:
+    """Test cases to ensure MCP $ref resolution fix is working in agent context."""
+
+    @patch("llama_stack.providers.utils.tools.mcp.list_mcp_tools")
+    async def test_agent_can_use_mcp_tools_with_resolved_refs(self, mock_list_mcp_tools):
+        """Test that agent can properly handle MCP tools with resolved $ref schemas."""
+        from llama_stack.apis.tools import ListToolDefsResponse
+        from llama_stack.providers.utils.tools.mcp import list_mcp_tools
+
+        # Mock MCP tool with resolved $ref schema (after the fix)
+        resolved_tool = ToolDef(
+            name="book_reservation",
+            description="Book a flight reservation with complex schema",
+            parameters=[
+                ToolParameter(
+                    name="flights",
+                    parameter_type="array",
+                    description="List of flights to book",
+                    required=True,
+                    title="Flights",
+                    items={
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "flight_number": {
+                                        "type": "string",
+                                        "description": "Flight number such as 'HAT001'",
+                                    },
+                                    "date": {"type": "string", "description": "Flight date in YYYY-MM-DD format"},
+                                },
+                                "required": ["flight_number", "date"],
+                                "title": "FlightInfo",
+                            },
+                            {"type": "object", "additionalProperties": True},
+                        ]
+                    },
+                ),
+                ToolParameter(
+                    name="passengers",
+                    parameter_type="array",
+                    description="List of passengers",
+                    required=True,
+                    title="Passengers",
+                    items={
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "first_name": {"type": "string", "description": "First name"},
+                                    "last_name": {"type": "string", "description": "Last name"},
+                                    "dob": {"type": "string", "description": "Date of birth"},
+                                },
+                                "required": ["first_name", "last_name", "dob"],
+                                "title": "Passenger",
+                            },
+                            {"type": "object", "additionalProperties": True},
+                        ]
+                    },
+                ),
+            ],
+            metadata={"endpoint": "http://localhost:8765/mcp/"},
+        )
+
+        mock_list_mcp_tools.return_value = ListToolDefsResponse(data=[resolved_tool])
+
+        # Call the function to verify it works with resolved schemas
+        result = await list_mcp_tools("http://localhost:8765/mcp/", {})
+
+        # Verify the tool has properly resolved schemas (no $ref remaining)
+        assert len(result.data) == 1
+        tool = result.data[0]
+        assert tool.name == "book_reservation"
+
+        # Verify flights parameter has resolved schema
+        flights_param = next(p for p in tool.parameters if p.name == "flights")
+        assert flights_param.items is not None
+        assert "anyOf" in flights_param.items
+        flight_info = flights_param.items["anyOf"][0]
+        assert "$ref" not in str(flight_info)  # Ensure no unresolved references
+        assert flight_info["type"] == "object"
+        assert "flight_number" in flight_info["properties"]
+        assert "date" in flight_info["properties"]
+
+        # Verify passengers parameter has resolved schema
+        passengers_param = next(p for p in tool.parameters if p.name == "passengers")
+        assert passengers_param.items is not None
+        assert "anyOf" in passengers_param.items
+        passenger_info = passengers_param.items["anyOf"][0]
+        assert "$ref" not in str(passenger_info)  # Ensure no unresolved references
+        assert passenger_info["type"] == "object"
+        assert "first_name" in passenger_info["properties"]
+        assert "last_name" in passenger_info["properties"]
+        assert "dob" in passenger_info["properties"]
+
+    @patch("llama_stack.providers.utils.tools.mcp.client_wrapper")
+    async def test_mcp_ref_resolution_integration_with_agent_tools(self, mock_client_wrapper):
+        """Test MCP reference resolution works end-to-end when agent loads tools."""
+        from llama_stack.providers.utils.tools.mcp import list_mcp_tools
+
+        # Create mock MCP client session with $ref schemas (before resolution)
+        session = AsyncMock()
+
+        mock_tool = MagicMock()
+        mock_tool.name = "complex_tool"
+        mock_tool.description = "Tool with complex $ref schemas"
+        mock_tool.inputSchema = {
+            "$defs": {
+                "FlightInfo": {
+                    "type": "object",
+                    "properties": {
+                        "flight_number": {"type": "string", "description": "Flight identifier"},
+                        "departure_time": {"type": "string", "description": "Departure time"},
+                    },
+                    "required": ["flight_number", "departure_time"],
+                    "title": "FlightInfo",
+                },
+                "BookingRequest": {
+                    "type": "object",
+                    "properties": {
+                        "booking_id": {"type": "string"},
+                        "flight": {"$ref": "#/$defs/FlightInfo"},  # Nested $ref
+                    },
+                    "required": ["booking_id", "flight"],
+                    "title": "BookingRequest",
+                },
+            },
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "description": "User identifier"},
+                "booking": {"$ref": "#/$defs/BookingRequest"},  # Root level $ref
+            },
+            "required": ["user_id", "booking"],
+        }
+
+        mock_tools_result = MagicMock()
+        mock_tools_result.tools = [mock_tool]
+        session.list_tools.return_value = mock_tools_result
+
+        mock_client_wrapper.return_value.__aenter__.return_value = session
+
+        # Test that the MCP tool loading resolves all $refs properly
+        result = await list_mcp_tools("http://localhost:8765/mcp/", {})
+
+        assert len(result.data) == 1
+        tool = result.data[0]
+        assert tool.name == "complex_tool"
+        assert len(tool.parameters) == 2
+
+        # Verify user_id parameter (no refs)
+        user_id_param = next(p for p in tool.parameters if p.name == "user_id")
+        assert user_id_param.parameter_type == "string"
+        assert user_id_param.description == "User identifier"
+
+        # Verify booking parameter has resolved nested $refs
+        booking_param = next(p for p in tool.parameters if p.name == "booking")
+        assert booking_param.parameter_type == "object"
+        assert booking_param.items is not None
+
+        # Verify the nested $ref resolution worked
+        booking_schema = booking_param.items
+        assert "$ref" not in str(booking_schema)  # No unresolved references should remain
+        assert booking_schema["type"] == "object"
+        assert "booking_id" in booking_schema["properties"]
+        assert "flight" in booking_schema["properties"]
+
+        # Verify the deeply nested FlightInfo was resolved
+        flight_schema = booking_schema["properties"]["flight"]
+        assert "$ref" not in str(flight_schema)  # FlightInfo $ref should be resolved
+        assert flight_schema["type"] == "object"
+        assert "flight_number" in flight_schema["properties"]
+        assert "departure_time" in flight_schema["properties"]
+        assert flight_schema["properties"]["flight_number"]["description"] == "Flight identifier"

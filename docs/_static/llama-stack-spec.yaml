@@ -5129,6 +5129,20 @@ components:
             - type: object
           description: >-
             (Optional) Default value for the parameter if not provided
+        items:
+          oneOf:
+            - type: 'null'
+            - type: boolean
+            - type: number
+            - type: string
+            - type: array
+            - type: object
+          description: >-
+            (Optional) Items schema for array-type parameters
+        title:
+          type: string
+          description: >-
+            (Optional) Human-readable title for the parameter
       additionalProperties: false
       required:
         - name

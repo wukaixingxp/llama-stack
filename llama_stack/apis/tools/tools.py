@@ -27,6 +27,8 @@ class ToolParameter(BaseModel):
     :param description: Human-readable description of what the parameter does
     :param required: Whether this parameter is required for tool invocation
     :param default: (Optional) Default value for the parameter if not provided
+    :param items: (Optional) Items schema for array-type parameters
+    :param title: (Optional) Human-readable title for the parameter
     """
 
     name: str
@@ -34,6 +36,8 @@ class ToolParameter(BaseModel):
     description: str
     required: bool = Field(default=True)
     default: Any | None = None
+    items: Any | None = None
+    title: str | None = None
 
 
 @json_schema_type
